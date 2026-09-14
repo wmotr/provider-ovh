@@ -3,19 +3,16 @@ kind: Provider
 metadata:
   name: provider-ovh
   annotations:
-    meta.crossplane.io/description: Crossplane Provider for OVH Cloud
+    meta.crossplane.io/description: Crossplane Provider for OVH Cloud, wmotr SDK import fix
     meta.crossplane.io/license: Apache-2.0
-    meta.crossplane.io/maintainer: Edixos Maintainers
-    meta.crossplane.io/source: github.com/edixos/provider-ovh
+    meta.crossplane.io/maintainer: wmotr
+    meta.crossplane.io/source: github.com/wmotr/provider-ovh
     meta.crossplane.io/readme: |
-      `provider-ovh` is the Crossplane infrastructure provider for [OVH Cloud](https://ovh.com/).
+      This fork of Edixos provider-ovh v2.19.1 corrects raw SDK identifiers for
+      existing OVH Kubernetes clusters and node pools. Provider APIs and CRDs
+      are unchanged. Source and support: https://github.com/wmotr/provider-ovh.
 
-      If you encounter an issue please create an issue in
-      the
-      [edixos/provider-ovh](https://github.com/edixos/provider-ovh)
-      repo.
-
-      Maintained by [Edixos](https://edixos.com).
+      Upstream project and license: https://github.com/edixos/provider-ovh.
 spec:
   capabilities:
     - SafeStart
