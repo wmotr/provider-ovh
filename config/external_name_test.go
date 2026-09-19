@@ -11,6 +11,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	tf "github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
+	ovhtf "github.com/ovh/terraform-provider-ovh/v2/ovh"
 )
 
 func TestUserIdentifierFromProvider(t *testing.T) {
@@ -147,6 +150,138 @@ func TestDatabaseLogSubscriptionIdentifierFromProvider(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			got, err := databaseLogSubscriptionIdentifierFromProvider.GetIDFn(context.Background(), tc.externalName, tc.params, nil)
 			assertGetID(t, got, err, tc.want, tc.wantErr)
+		})
+	}
+}
+
+func TestKubeSDKIdentifiersUseRawProviderIDs(t *testing.T) {
+	cases := map[string]struct {
+		externalName string
+		params       map[string]any
+	}{
+		"ovh_cloud_project_kube": {
+			externalName: "7d058f8c-dd00-4e0f-995f-33656aab9e96",
+			params:       map[string]any{"service_name": "project-id"},
+		},
+		"ovh_cloud_project_kube_nodepool": {
+			externalName: "92c1ddfb-8d9f-4e22-b70b-5c446829fe1e",
+			params: map[string]any{
+				"service_name": "project-id",
+				"kube_id":      "7d058f8c-dd00-4e0f-995f-33656aab9e96",
+			},
+		},
+	}
+
+	for resourceName, tc := range cases {
+		t.Run(resourceName, func(t *testing.T) {
+			cfg := TerraformPluginSDKExternalNameConfigs[resourceName]
+			got, err := cfg.GetIDFn(context.Background(), tc.externalName, tc.params, nil)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.externalName {
+				t.Fatalf("SDK read ID = %q, want raw provider UUID %q", got, tc.externalName)
+			}
+			if !cfg.DisableNameInitializer {
+				t.Fatal("provider-assigned IDs must keep the name initializer disabled")
+			}
+		})
+	}
+}
+
+func TestKubeSDKRawIDsReachExactReadEndpoints(t *testing.T) {
+	const (
+		serviceName = "project-id"
+		clusterID   = "7d058f8c-dd00-4e0f-995f-33656aab9e96"
+		poolID      = "92c1ddfb-8d9f-4e22-b70b-5c446829fe1e"
+	)
+
+	cases := map[string]struct {
+		resourceName string
+		externalName string
+		attributes   map[string]string
+		responses    map[string]string
+	}{
+		"Cluster": {
+			resourceName: "ovh_cloud_project_kube",
+			externalName: clusterID,
+			attributes: map[string]string{
+				"service_name": serviceName,
+				"name":         "gh-runners",
+				"region":       "GRA11",
+			},
+			responses: map[string]string{
+				"GET /cloud/project/" + serviceName + "/kube/" + clusterID:                  `{"id":"` + clusterID + `","name":"gh-runners","region":"GRA11","status":"READY","version":"1.33.10-4","updatePolicy":"MINIMAL_DOWNTIME","plan":"free","nextUpgradeVersions":[],"customization":{},"ipAllocationPolicy":{}}`,
+				"POST /cloud/project/" + serviceName + "/kube/" + clusterID + "/kubeconfig": `{"content":"apiVersion: v1\nkind: Config\nclusters:\n- name: cluster\n  cluster:\n    server: https://example.invalid\n    certificate-authority-data: dummy\ncontexts: []\nusers:\n- name: user\n  user:\n    client-certificate-data: dummy\n    client-key-data: dummy\n"}`,
+			},
+		},
+		"NodePool": {
+			resourceName: "ovh_cloud_project_kube_nodepool",
+			externalName: poolID,
+			attributes: map[string]string{
+				"service_name": serviceName,
+				"kube_id":      clusterID,
+				"name":         "workers",
+				"flavor_name":  "b3-16",
+			},
+			responses: map[string]string{
+				"GET /cloud/project/" + serviceName + "/kube/" + clusterID + "/nodepool/" + poolID: `{"id":"` + poolID + `","name":"workers","flavor":"b3-16","status":"READY","autoscale":true,"desiredNodes":4,"currentNodes":4,"availableNodes":4,"minNodes":0,"maxNodes":4,"monthlyBilled":false,"availabilityZones":[],"autoscaling":{}}`,
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			requested := make(map[string]bool, len(tc.responses))
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				key := r.Method + " " + r.URL.Path
+				if key == "GET /auth/details" {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{}`))
+					return
+				}
+				body, ok := tc.responses[key]
+				if !ok {
+					t.Errorf("unexpected OVH request %s", key)
+					http.NotFound(w, r)
+					return
+				}
+				requested[key] = true
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+
+			provider := ovhtf.Provider()
+			diagnostics := provider.Configure(context.Background(), tf.NewResourceConfigRaw(map[string]any{
+				"endpoint":     server.URL,
+				"access_token": "test-token",
+			}))
+			if diagnostics.HasError() {
+				t.Fatalf("configure OVH provider: %v", diagnostics)
+			}
+
+			cfg := TerraformPluginSDKExternalNameConfigs[tc.resourceName]
+			id, err := cfg.GetIDFn(context.Background(), tc.externalName, map[string]any{
+				"service_name": serviceName,
+				"kube_id":      clusterID,
+			}, nil)
+			if err != nil {
+				t.Fatalf("resolve SDK ID: %v", err)
+			}
+			state := &tf.InstanceState{ID: id, Attributes: tc.attributes}
+			observed, refreshDiagnostics := provider.ResourcesMap[tc.resourceName].RefreshWithoutUpgrade(context.Background(), state, provider.Meta())
+			if refreshDiagnostics.HasError() {
+				t.Fatalf("refresh %s: %v", tc.resourceName, refreshDiagnostics)
+			}
+			if observed == nil || observed.ID != tc.externalName {
+				t.Fatalf("observed ID = %v, want %s", observed, tc.externalName)
+			}
+			for endpoint := range tc.responses {
+				if !requested[endpoint] {
+					t.Errorf("expected OVH request %s was not made", endpoint)
+				}
+			}
 		})
 	}
 }
